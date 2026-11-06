@@ -1,10 +1,16 @@
-// 杠杠の导演台 · 阶段 1: 导演人设
+// 杠杠の导演台 · 阶段 1+3: 导演人设 + 重 roll 防护
 //
 // 监听酒馆新楼 → 把剧情 POST 给本机 ST-bridge (DSH 导演 Agent) → 导演按人设判断这一楼
 // 该呈现什么 (nothing / show_image / play_music, 阶段 1 假执行只打印) → 回显结果.
+// 阶段 3: 动作登记表持久化, swipe/删除/编辑时作废, 下一楼告知导演.
 // 工具往返协议见 E:\ST-bridge\EXTERNAL-TOOLS.md:
 //   stream:false, 串行, 每次返回一个 tool_call, 按 tool_call_id 回填, 回填用新 request_id,
 //   网络重试必须复用原 request_id 与相同请求内容.
+
+// 模块导入即信标 (区分"模块没被导入"与"模块内初始化崩溃")
+try {
+  (top.window.__daoyantai_m ??= { importedAt: Date.now() });
+} catch { /* ignore */ }
 
 const TAG = '【导演台】';
 const BRIDGE_URL = 'http://127.0.0.1:43121/v1/chat/completions';
@@ -191,6 +197,19 @@ async function runDirectorRound(dyt_chat_id: string, base_request_id: string, me
       for (const call of choice.tool_calls) {
         executeTool(call, base_request_id);
         beacon(`tool ${base_request_id} ${call.function.name}`);
+        // 登记动作 (阶段 3): show_image/play_music 才算"呈现动作", nothing 不登记
+        if (call.function.name !== 'nothing') {
+          const [floorStr, ...rest] = base_request_id.split('-');
+          recordAction({
+            key: `${dyt_chat_id}:${base_request_id}`,
+            // 存裸 chat_id (不带 dyt- 前缀), 与作废事件里的 getCurrentChatId() 一致
+            chat_id: dyt_chat_id.replace(/^dyt-/, ''),
+            floor: Number(floorStr),
+            swipe: Number(rest.join('-')) || 0,
+            tool: call.function.name,
+            args: call.function.arguments,
+          });
+        }
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: true }) });
       }
       continue;
@@ -234,6 +253,99 @@ function beacon(event: string) {
   } catch {
     /* 跨源不可达时静默 */
   }
+}
+
+// ---------------------------------------------------------------------------
+// 动作登记表 (阶段 3): 持久化导演决定, 楼层重写/删除时作废
+// ---------------------------------------------------------------------------
+
+const ActionEntry = z.object({
+  key: z.string(),
+  chat_id: z.string(),
+  floor: z.number(),
+  swipe: z.number(),
+  tool: z.string(),
+  args: z.string(),
+  at: z.number(),
+  status: z.enum(['submitted', 'void']),
+  /** 作废原因是否已告知导演 (只告知一次, 省调用) */
+  told: z.boolean().default(false),
+});
+type ActionEntry = z.infer<typeof ActionEntry>;
+
+const ActionLog = z.object({ version: z.literal(1), actions: z.array(ActionEntry).max(100) }).default({ version: 1, actions: [] });
+
+/** 登记表变量名 (脚本变量空间) */
+const ACTION_LOG_KEY = '导演台动作登记表';
+/** 内存中的登记表, 写盘走串行链 */
+let actionLog: z.infer<typeof ActionLog> = ActionLog.parse(undefined);
+let actionLogDirty = false;
+
+function loadActionLog() {
+  try {
+    const vars = getVariables({ type: 'script', script_id: getScriptId() });
+    actionLog = ActionLog.parse(vars[ACTION_LOG_KEY]);
+  } catch (error) {
+    console.warn(`${TAG}动作登记表读取失败, 使用空表:`, error);
+    actionLog = ActionLog.parse(undefined);
+  }
+}
+
+function flushActionLog() {
+  if (!actionLogDirty) {
+    return;
+  }
+  actionLogDirty = false;
+  try {
+    replaceVariables({ [ACTION_LOG_KEY]: actionLog }, { type: 'script', script_id: getScriptId() });
+  } catch (error) {
+    console.error(`${TAG}动作登记表写盘失败:`, error);
+    actionLogDirty = true;
+  }
+}
+
+/** 登记一个动作 (submitted); 同 key 只登记一次 */
+function recordAction(entry: Omit<ActionEntry, 'at' | 'status' | 'told'>) {
+  if (actionLog.actions.some(a => a.key === entry.key)) {
+    return;
+  }
+  actionLog.actions.push({ ...entry, at: Date.now(), status: 'submitted', told: false });
+  // 只保留最近 100 条
+  if (actionLog.actions.length > 100) {
+    actionLog.actions.splice(0, actionLog.actions.length - 100);
+  }
+  actionLogDirty = true;
+  flushActionLog();
+}
+
+/** 作废某楼层的所有未作废动作; 返回本次作废的条目 (供告知导演) */
+function voidActionsFor(chatId: string, floor: number, reason: string): ActionEntry[] {
+  const hit = actionLog.actions.filter(
+    a => a.chat_id === chatId && a.floor === floor && a.status === 'submitted',
+  );
+  beacon(`void ${floor} ${reason} hit=${hit.length} mem=${actionLog.actions.length} chat=${String(chatId).slice(0, 10)}`);
+  for (const a of hit) {
+    a.status = 'void';
+    a.told = false;
+    console.info(`${TAG}动作作废 (${reason}): 第 ${floor} 楼 ${a.tool}`);
+  }
+  if (hit.length) {
+    actionLogDirty = true;
+    flushActionLog();
+  }
+  return hit;
+}
+
+/** 取一条未告知的作废, 标记 told 并返回描述 (下一楼带给导演, 每次只带一条) */
+function nextUntoldVoid(): string | null {
+  const entry = actionLog.actions.find(a => a.status === 'void' && !a.told);
+  if (!entry) {
+    return null;
+  }
+  entry.told = true;
+  actionLogDirty = true;
+  flushActionLog();
+  return `注意: 第 ${entry.floor} 楼已被重写, 你此前对它的 ${entry.tool} 决定已作废, 请以最新内容为准。`;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,11 +401,14 @@ async function handleFloorInner(message_id: number) {
 
   console.info(`${TAG}第 ${message_id} 楼 (swipe ${swipe_id}) 已生成, 交给导演审阅…`);
   toastr.info(`第 ${message_id} 楼 (swipe ${swipe_id})`, `${TAG}交给导演审阅`, { timeOut: 5000 });
+  // 阶段 3: 若有未告知的作废, 让导演知道楼被重写过
+  const untold = nextUntoldVoid();
   const messages: ChatMessage[] = [
     { role: 'system', content: DIRECTOR_RULES },
     {
       role: 'user',
       content:
+        (untold ? `${untold}\n\n` : '') +
         `第 ${message_id} 楼剧情已生成 (swipe ${swipe_id})。` +
         `请阅读以下内容, 按你的判断调用工具 (nothing / show_image / play_music):\n\n${text}`,
     },
@@ -317,7 +432,30 @@ function enqueueFloor(message_id: number, type: string) {
 
 $(() => {
   beacon('loaded');
+  loadActionLog();
   eventOn(tavern_events.MESSAGE_RECEIVED, (message_id: number, type: string) => enqueueFloor(message_id, type));
-  console.info(`${TAG}已加载 (阶段 1), 监听新楼中 (桥: ${BRIDGE_URL})`);
+  // 阶段 3: 楼层被切走/删除/编辑 → 该楼未完成动作作废
+  eventOn(tavern_events.MESSAGE_SWIPED, (message_id: number) => {
+    beacon(`evt swiped ${message_id}`);
+    const chat_id = SillyTavern.getCurrentChatId();
+    if (chat_id) {
+      voidActionsFor(chat_id, message_id, 'swipe 切换');
+    }
+  });
+  eventOn(tavern_events.MESSAGE_DELETED, (message_id: number) => {
+    beacon(`evt deleted ${message_id}`);
+    const chat_id = SillyTavern.getCurrentChatId();
+    if (chat_id) {
+      voidActionsFor(chat_id, message_id, '楼层删除');
+    }
+  });
+  eventOn(tavern_events.MESSAGE_EDITED, (message_id: number) => {
+    beacon(`evt edited ${message_id}`);
+    const chat_id = SillyTavern.getCurrentChatId();
+    if (chat_id) {
+      voidActionsFor(chat_id, message_id, '楼层编辑');
+    }
+  });
+  console.info(`${TAG}已加载 (阶段 1+3), 监听新楼中 (桥: ${BRIDGE_URL})`);
   toastr.success('导演出勤, 剧情到了就叫!', TAG);
 });
