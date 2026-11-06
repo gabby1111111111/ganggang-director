@@ -1,32 +1,81 @@
-// 杠杠の导演台 · 阶段 0: 链路打通
+// 杠杠の导演台 · 阶段 1: 导演人设
 //
-// 监听酒馆新楼 → 把剧情 POST 给本机 ST-bridge (DSH 导演 Agent) → 控制台打印导演回复.
+// 监听酒馆新楼 → 把剧情 POST 给本机 ST-bridge (DSH 导演 Agent) → 导演按人设判断这一楼
+// 该呈现什么 (nothing / show_image / play_music, 阶段 1 假执行只打印) → 回显结果.
 // 工具往返协议见 E:\ST-bridge\EXTERNAL-TOOLS.md:
-//   stream:false, 串行, 每次返回一个 tool_call, 按 tool_call_id 回填, 回填用新 request_id.
+//   stream:false, 串行, 每次返回一个 tool_call, 按 tool_call_id 回填, 回填用新 request_id,
+//   网络重试必须复用原 request_id 与相同请求内容.
 
 const TAG = '【导演台】';
 const BRIDGE_URL = 'http://127.0.0.1:43121/v1/chat/completions';
 const CLIENT_ID = 'daoyantai';
 const TASK_ID = 'director';
 const REQUEST_TIMEOUT_MS = 120_000;
+/** 网络失败重试次数 (同 request_id 同内容, 符合桥的去重协议) */
+const MAX_RETRY = 2;
 /** 导演回合最大轮数 (工具调用次数上限), 防止意外死循环 */
 const MAX_ROUNDS = 8;
 /** 只处理这些类型的 MESSAGE_RECEIVED, 其余 (quiet/continue/append...) 忽略 */
 const INTERESTING_TYPES = ['normal', 'first_message', 'swipe', 'regenerate'];
+/** 等正文落楼的最长时间 (message_received 在本环境早于文本落楼触发) */
+const WAIT_TEXT_MS = 60_000;
 
-/** 阶段 0 只给 report(): 让导演汇报读后感, 本地假执行 */
+/** 导演人设与判断规则, 随每楼请求注入 (DSH 侧 Agent preset 之上) */
+const DIRECTOR_RULES = `你是酒馆剧情的幕后导演, 每读完毕一楼剧情, 决定现实中要不要呈现画面或音乐。
+
+判断规则:
+- 关键楼 (考虑 show_image): 强情绪转折、新地点/新角色登场、重要物件或承诺、战斗或亲密时刻、有明确"画面感"的描写。
+- 过场楼 (通常 nothing): 日常对话、内心独白、信息量低、赶路或等待。
+- play_music 只在场景基调明确变化时给 (新场景、氛围转折); 同一场景不重复给同一首。
+- show_image 要给出画面主体与视觉提示词 (场景/人物动作/氛围, 中文)。
+- 宁可安静也不要硬凑: 没有合适的呈现就 nothing。
+- 决定说明放在工具参数里, 最终回复一句话即可, 不要复述剧情。`;
+
+/** 阶段 1 工具: 都在本脚本内假执行 (只打印), 阶段 2/4 接入生图机/调音台真管线 */
 const TOOLS = [
   {
     type: 'function',
     function: {
-      name: 'report',
-      description: '读完这一楼剧情后, 用它汇报你的读后感',
+      name: 'nothing',
+      description: '这一楼不需要任何呈现',
       parameters: {
         type: 'object',
         properties: {
-          thought: { type: 'string', description: '一两句话的读后感' },
+          reason: { type: 'string', description: '一句话理由' },
         },
-        required: ['thought'],
+        required: ['reason'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'show_image',
+      description: '在现实中呈现一幅画面',
+      parameters: {
+        type: 'object',
+        properties: {
+          subject: { type: 'string', description: '画面主体' },
+          prompt: { type: 'string', description: '视觉提示词: 场景/人物动作/氛围' },
+        },
+        required: ['subject', 'prompt'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'play_music',
+      description: '为当前场景配乐',
+      parameters: {
+        type: 'object',
+        properties: {
+          mood: { type: 'string', description: '曲风与情绪' },
+          title: { type: 'string', description: '可选: 具体歌名' },
+        },
+        required: ['mood'],
         additionalProperties: false,
       },
     },
@@ -40,7 +89,7 @@ interface ToolCall {
 }
 
 type ChatMessage = {
-  role: 'user' | 'assistant' | 'tool';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | null;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
@@ -95,10 +144,25 @@ async function postChat(messages: ChatMessage[], dsh_session: DshSession): Promi
   }
 }
 
+/** 网络失败重试: 协议要求复用同一 request_id 与相同请求内容, 因此在原地重试而非换 ID */
+async function postChatWithRetry(messages: ChatMessage[], dsh_session: DshSession): Promise<BridgeResponse> {
+  for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+    try {
+      return await postChat(messages, dsh_session);
+    } catch (error) {
+      if (attempt === MAX_RETRY) {
+        throw error;
+      }
+      console.warn(`${TAG}请求失败 (第 ${attempt} 次), 复用 request_id=${dsh_session.request_id} 重试:`, error);
+      await new Promise(resolve => setTimeout(resolve, 3_000));
+    }
+  }
+  throw new Error('unreachable');
+}
+
 /**
  * 跑完一个导演回合: 请求 → (工具调用则假执行并回填) → 最终正文.
- * 网络重试需复用同一 request_id (桥按 request_id 去重), 因此重试逻辑放在 postChat 外层由调用方决定;
- * 这里每轮回填使用新的 request_id.
+ * 回填请求使用新的 request_id (`-rN` 后缀), 重试复用同一 request_id.
  */
 async function runDirectorRound(dyt_chat_id: string, base_request_id: string, messages: ChatMessage[]) {
   let session_id: string | undefined;
@@ -114,7 +178,7 @@ async function runDirectorRound(dyt_chat_id: string, base_request_id: string, me
       fixed_message_types: [],
       ...(session_id ? { session_id } : {}),
     };
-    const resp = await postChat(messages, dsh_session);
+    const resp = await postChatWithRetry(messages, dsh_session);
     session_id = resp.dsh_session?.session_id ?? session_id;
 
     const choice = resp.choices?.[0]?.message;
@@ -122,25 +186,38 @@ async function runDirectorRound(dyt_chat_id: string, base_request_id: string, me
       throw new Error('桥返回缺少 choices[0].message');
     }
 
-    // 阶段 0: 工具只有 report, 假执行 (打印) 后回填成功结果, 让导演继续
     if (choice.tool_calls?.length) {
       messages.push(choice);
       for (const call of choice.tool_calls) {
-        console.info(`${TAG}导演调用 ${call.function.name}(${call.function.arguments})`);
+        executeTool(call, base_request_id);
+        beacon(`tool ${base_request_id} ${call.function.name}`);
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: true }) });
       }
       continue;
     }
 
-    console.info(`${TAG}导演读后感: ${choice.content ?? '(空回复)'}`);
-    toastr.info(String(choice.content ?? '(空回复)'), `${TAG}第 ${base_request_id.split('-')[0]} 楼`, { timeOut: 10000 });
+    console.info(`${TAG}导演: ${choice.content ?? '(空回复)'}`);
+    beacon(`done ${base_request_id} ${(choice.content ?? '').slice(0, 80).replace(/\s+/g, ' ')}`);
     return;
   }
   console.warn(`${TAG}导演回合超过 ${MAX_ROUNDS} 轮, 放弃等待`);
 }
 
+/** 阶段 1 假执行: 只打印与提示; show_image/play_music 弹 toast, nothing 保持安静 */
+function executeTool(call: ToolCall, base_request_id: string) {
+  console.info(`${TAG}导演调用 ${call.function.name}(${call.function.arguments})`);
+  const floor = base_request_id.split('-', 1)[0];
+  if (call.function.name === 'show_image') {
+    const args = JSON.parse(call.function.arguments) as { subject?: string; prompt?: string };
+    toastr.success(`出图: ${args.subject ?? ''} —— ${args.prompt ?? ''}`, `${TAG}第 ${floor} 楼`, { timeOut: 30000 });
+  } else if (call.function.name === 'play_music') {
+    const args = JSON.parse(call.function.arguments) as { mood?: string; title?: string };
+    toastr.success(`配乐: ${args.title ? `《${args.title}》` : ''}${args.mood ?? ''}`, `${TAG}第 ${floor} 楼`, { timeOut: 30000 });
+  }
+}
+
 // ---------------------------------------------------------------------------
-// 调试信标: 供外部确认脚本存活与事件流 (阶段 0 临时手段, 后续移除)
+// 调试信标: 供外部确认脚本存活与事件流 (调试期手段, 稳定后移除)
 // ---------------------------------------------------------------------------
 
 declare global {
@@ -180,7 +257,6 @@ async function handleFloor(message_id: number) {
 async function handleFloorInner(message_id: number) {
   beacon(`handle ${message_id}`);
   const chat_id = SillyTavern.getCurrentChatId();
-  beacon(`chat_id=${String(chat_id).slice(0, 40)}`);
   if (!chat_id) {
     toastr.warn('拿不到聊天 ID, 跳过', TAG);
     return;
@@ -189,7 +265,7 @@ async function handleFloorInner(message_id: number) {
   // 等正文落楼: message_received 可能在文本写入前触发 (本环境实测如此)
   let text = '';
   let swipe_id = 0;
-  for (let waited = 0; waited < 180_000; waited += 2_000) {
+  for (let waited = 0; waited < WAIT_TEXT_MS; waited += 2_000) {
     const cur = getChatMessages(message_id, { include_swipes: true })[0];
     swipe_id = cur?.swipe_id ?? 0;
     text = (cur?.message ?? '').trim() || String(cur?.swipes?.[swipe_id] ?? '').trim();
@@ -200,7 +276,7 @@ async function handleFloorInner(message_id: number) {
   }
   beacon(`floor ${message_id} swipe=${swipe_id} text_len=${text.length}`);
   if (!text) {
-    toastr.warn(`第 ${message_id} 楼迟迟没有正文, 放弃`, TAG);
+    console.warn(`${TAG}第 ${message_id} 楼迟迟没有正文, 放弃`);
     return;
   }
 
@@ -212,13 +288,14 @@ async function handleFloorInner(message_id: number) {
   handled.add(key);
 
   console.info(`${TAG}第 ${message_id} 楼 (swipe ${swipe_id}) 已生成, 交给导演审阅…`);
-  toastr.info(`第 ${message_id} 楼 (swipe ${swipe_id})`, `${TAG}交给导演审阅`);
+  toastr.info(`第 ${message_id} 楼 (swipe ${swipe_id})`, `${TAG}交给导演审阅`, { timeOut: 5000 });
   const messages: ChatMessage[] = [
+    { role: 'system', content: DIRECTOR_RULES },
     {
       role: 'user',
       content:
         `第 ${message_id} 楼剧情已生成 (swipe ${swipe_id})。` +
-        `请阅读以下内容, 然后调用 report() 汇报你的读后感:\n\n${text}`,
+        `请阅读以下内容, 按你的判断调用工具 (nothing / show_image / play_music):\n\n${text}`,
     },
   ];
   await runDirectorRound(`dyt-${chat_id}`, `${message_id}-${swipe_id}`, messages);
@@ -241,6 +318,6 @@ function enqueueFloor(message_id: number, type: string) {
 $(() => {
   beacon('loaded');
   eventOn(tavern_events.MESSAGE_RECEIVED, (message_id: number, type: string) => enqueueFloor(message_id, type));
-  console.info(`${TAG}已加载, 监听新楼中 (桥: ${BRIDGE_URL})`);
-  toastr.success('监听新楼中, 导演出勤！', TAG);
+  console.info(`${TAG}已加载 (阶段 1), 监听新楼中 (桥: ${BRIDGE_URL})`);
+  toastr.success('导演出勤, 剧情到了就叫!', TAG);
 });
