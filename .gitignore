@@ -11,3 +11,6 @@ pnpm-debug.log*
 
 auto-imports.d.ts
 components.d.ts
+
+# 本机交接文档, 含局域网/账号等敏感信息, 只留本地
+HANDOFF.md

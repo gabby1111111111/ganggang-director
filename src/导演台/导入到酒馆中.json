@@ -1,0 +1,7 @@
+{
+  "id": "8f2d3a10-5c47-4b6e-9a21-d3f7c8e4b902",
+  "name": "杠杠の导演台",
+  "content": "import 'http://localhost:5500/dist/导演台/index.js'",
+  "info": "阶段 0: 监听新楼, POST 给本机 ST-bridge (DSH 导演 Agent), console 打印读后感.\n需要先启动: 1) node tools/dev_server.mjs  2) DSH + ST-bridge (43121)",
+  "buttons": []
+}
