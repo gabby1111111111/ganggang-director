@@ -142,7 +142,9 @@ async function postChat(messages: ChatMessage[], dsh_session: DshSession): Promi
     });
     const text = await resp.text();
     if (!resp.ok) {
-      throw new Error(`桥返回 HTTP ${resp.status}: ${text.slice(0, 500)}`);
+      const error = new Error(`桥返回 HTTP ${resp.status}: ${text.slice(0, 500)}`);
+      (error as Error & { status?: number }).status = resp.status;
+      throw error;
     }
     return JSON.parse(text) as BridgeResponse;
   } finally {
@@ -150,13 +152,18 @@ async function postChat(messages: ChatMessage[], dsh_session: DshSession): Promi
   }
 }
 
-/** 网络失败重试: 协议要求复用同一 request_id 与相同请求内容, 因此在原地重试而非换 ID */
+/**
+ * 失败重试: 协议要求复用同一 request_id 与相同请求内容, 因此在原地重试而非换 ID.
+ * 只重试网络类错误 (fetch/超时) 与 5xx; 4xx (如 409 幂等冲突) 重试必然复现, 直接抛出.
+ */
 async function postChatWithRetry(messages: ChatMessage[], dsh_session: DshSession): Promise<BridgeResponse> {
   for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
     try {
       return await postChat(messages, dsh_session);
     } catch (error) {
-      if (attempt === MAX_RETRY) {
+      const status = (error as Error & { status?: number }).status;
+      const retryable = status === undefined || status >= 500;
+      if (attempt === MAX_RETRY || !retryable) {
         throw error;
       }
       console.warn(`${TAG}请求失败 (第 ${attempt} 次), 复用 request_id=${dsh_session.request_id} 重试:`, error);
@@ -195,22 +202,28 @@ async function runDirectorRound(dyt_chat_id: string, base_request_id: string, me
     if (choice.tool_calls?.length) {
       messages.push(choice);
       for (const call of choice.tool_calls) {
-        executeTool(call, base_request_id);
-        beacon(`tool ${base_request_id} ${call.function.name}`);
-        // 登记动作 (阶段 3): show_image/play_music 才算"呈现动作", nothing 不登记
-        if (call.function.name !== 'nothing') {
-          const [floorStr, ...rest] = base_request_id.split('-');
-          recordAction({
-            key: `${dyt_chat_id}:${base_request_id}`,
-            // 存裸 chat_id (不带 dyt- 前缀), 与作废事件里的 getCurrentChatId() 一致
-            chat_id: dyt_chat_id.replace(/^dyt-/, ''),
-            floor: Number(floorStr),
-            swipe: Number(rest.join('-')) || 0,
-            tool: call.function.name,
-            args: call.function.arguments,
-          });
-        }
+        // 回填必须最先做: 协议要求 DSH 原生执行器在等回填, 假执行/登记绝不能挡住它
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: true }) });
+        try {
+          executeTool(call, base_request_id);
+          beacon(`tool ${base_request_id} ${call.function.name}`);
+          // 登记动作 (阶段 3): show_image/play_music 才算"呈现动作", nothing 不登记
+          if (call.function.name !== 'nothing') {
+            const [floorStr, ...rest] = base_request_id.split('-');
+            recordAction({
+              key: `${dyt_chat_id}:${base_request_id}`,
+              // 存裸 chat_id (不带 dyt- 前缀), 与作废事件里的 getCurrentChatId() 一致
+              chat_id: dyt_chat_id.replace(/^dyt-/, ''),
+              floor: Number(floorStr),
+              swipe: Number(rest.join('-')) || 0,
+              tool: call.function.name,
+              args: call.function.arguments,
+            });
+          }
+        } catch (error) {
+          // 假执行自身的错误不影响回合继续
+          console.error(`${TAG}工具 ${call.function.name} 假执行出错:`, error);
+        }
       }
       continue;
     }
@@ -220,6 +233,7 @@ async function runDirectorRound(dyt_chat_id: string, base_request_id: string, me
     return;
   }
   console.warn(`${TAG}导演回合超过 ${MAX_ROUNDS} 轮, 放弃等待`);
+  toastr.warn(`导演回合超过 ${MAX_ROUNDS} 轮, 放弃等待`, TAG);
 }
 
 /** 阶段 1 假执行: 只打印与提示; show_image/play_music 弹 toast, nothing 保持安静 */
@@ -374,10 +388,16 @@ async function handleFloorInner(message_id: number) {
     return;
   }
 
-  // 等正文落楼: message_received 可能在文本写入前触发 (本环境实测如此)
+  // 等正文落楼: message_received 可能在文本写入前触发 (本环境实测如此).
+  // 期间若切了聊天, 本楼作废 (新聊天的楼层有自己的事件), 避免把别的聊天内容发进旧会话.
   let text = '';
   let swipe_id = 0;
   for (let waited = 0; waited < WAIT_TEXT_MS; waited += 2_000) {
+    if (SillyTavern.getCurrentChatId() !== chat_id) {
+      beacon(`bail ${message_id} chat changed`);
+      console.info(`${TAG}第 ${message_id} 楼等待期间聊天已切换, 放弃`);
+      return;
+    }
     const cur = getChatMessages(message_id, { include_swipes: true })[0];
     swipe_id = cur?.swipe_id ?? 0;
     text = (cur?.message ?? '').trim() || String(cur?.swipes?.[swipe_id] ?? '').trim();
